@@ -1,4 +1,4 @@
-(define-constant CONTRACT_OWNER tx-sender)
+﻿(define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_NOT_AUTHORIZED (err u100))
 (define-constant ERR_JOB_NOT_FOUND (err u101))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u102))
@@ -10,6 +10,9 @@
 (define-constant ERR_INSUFFICIENT_STAKE (err u108))
 (define-constant ERR_DISPUTE_EXISTS (err u109))
 (define-constant ERR_NO_DISPUTE (err u110))
+(define-constant ERR_ALREADY_RATED (err u111))
+(define-constant ERR_INVALID_RATING (err u112))
+(define-constant ERR_CANNOT_RATE_SELF (err u113))
 
 (define-constant MIN_STAKE u1000000)
 (define-constant PLATFORM_FEE_PERCENT u2)
@@ -18,6 +21,7 @@
 
 (define-data-var job-counter uint u0)
 (define-data-var dispute-counter uint u0)
+(define-data-var rating-counter uint u0)
 
 (define-map jobs
   uint
@@ -43,7 +47,10 @@
     completed-jobs: uint,
     failed-jobs: uint,
     total-earnings: uint,
-    is-active: bool
+    is-active: bool,
+    rating-sum: uint,
+    rating-count: uint,
+    average-rating: uint
   }
 )
 
@@ -69,6 +76,26 @@
   }
 )
 
+(define-map driver-ratings
+  uint
+  {
+    job-id: uint,
+    rater: principal,
+    rated-driver: principal,
+    rating: uint,
+    review: (string-ascii 300),
+    created-at: uint
+  }
+)
+
+(define-map job-ratings
+  uint
+  {
+    has-been-rated: bool,
+    rating-id: (optional uint)
+  }
+)
+
 (define-private (get-platform-fee (amount uint))
   (/ (* amount PLATFORM_FEE_PERCENT) u100)
 )
@@ -80,10 +107,17 @@
   )
 )
 
+(define-private (calculate-average-rating (rating-sum uint) (rating-count uint))
+  (if (is-eq rating-count u0)
+    u0
+    (/ rating-sum rating-count)
+  )
+)
+
 (define-private (update-user-profile (user principal) (earnings uint) (success bool))
   (let (
     (current-profile (default-to 
-      {reputation-score: u100, completed-jobs: u0, failed-jobs: u0, total-earnings: u0, is-active: true}
+      {reputation-score: u100, completed-jobs: u0, failed-jobs: u0, total-earnings: u0, is-active: true, rating-sum: u0, rating-count: u0, average-rating: u0}
       (map-get? user-profiles user)
     ))
   )
@@ -96,7 +130,10 @@
         completed-jobs: (if success (+ (get completed-jobs current-profile) u1) (get completed-jobs current-profile)),
         failed-jobs: (if success (get failed-jobs current-profile) (+ (get failed-jobs current-profile) u1)),
         total-earnings: (+ (get total-earnings current-profile) earnings),
-        is-active: (get is-active current-profile)
+        is-active: (get is-active current-profile),
+        rating-sum: (get rating-sum current-profile),
+        rating-count: (get rating-count current-profile),
+        average-rating: (get average-rating current-profile)
       }
     )
   )
@@ -132,6 +169,13 @@
         accepted-at: none,
         completed-at: none,
         description: description
+      }
+    )
+    
+    (map-set job-ratings job-id
+      {
+        has-been-rated: false,
+        rating-id: none
       }
     )
     
@@ -199,6 +243,59 @@
     (update-user-profile (get shipper job) u0 true)
     
     (ok true)
+  )
+)
+
+(define-public (rate-driver (job-id uint) (rating uint) (review (string-ascii 300)))
+  (let (
+    (job (unwrap! (map-get? jobs job-id) ERR_JOB_NOT_FOUND))
+    (driver (unwrap! (get driver job) ERR_NOT_DRIVER))
+    (job-rating (unwrap! (map-get? job-ratings job-id) ERR_JOB_NOT_FOUND))
+    (rating-id (+ (var-get rating-counter) u1))
+    (current-profile (default-to 
+      {reputation-score: u100, completed-jobs: u0, failed-jobs: u0, total-earnings: u0, is-active: true, rating-sum: u0, rating-count: u0, average-rating: u0}
+      (map-get? user-profiles driver)
+    ))
+  )
+    (asserts! (is-eq tx-sender (get shipper job)) ERR_NOT_SHIPPER)
+    (asserts! (is-eq (get status job) "completed") ERR_INVALID_STATUS)
+    (asserts! (not (get has-been-rated job-rating)) ERR_ALREADY_RATED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (not (is-eq tx-sender driver)) ERR_CANNOT_RATE_SELF)
+    
+    (map-set driver-ratings rating-id
+      {
+        job-id: job-id,
+        rater: tx-sender,
+        rated-driver: driver,
+        rating: rating,
+        review: review,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set job-ratings job-id
+      {
+        has-been-rated: true,
+        rating-id: (some rating-id)
+      }
+    )
+    
+    (let (
+      (new-rating-sum (+ (get rating-sum current-profile) rating))
+      (new-rating-count (+ (get rating-count current-profile) u1))
+    )
+      (map-set user-profiles driver (merge current-profile
+        {
+          rating-sum: new-rating-sum,
+          rating-count: new-rating-count,
+          average-rating: (calculate-average-rating new-rating-sum new-rating-count)
+        }
+      ))
+    )
+    
+    (var-set rating-counter rating-id)
+    (ok rating-id)
   )
 )
 
@@ -324,14 +421,22 @@
   (map-get? job-stakes job-id)
 )
 
-(define-read-only (get-contract-balance)
+(define-read-only (get-driver-rating (rating-id uint))
+  (map-get? driver-ratings rating-id)
+)
+
+(define-read-only (get-job-rating-info (job-id uint))
+  (map-get? job-ratings job-id)
+)
+
+(define-read-only (get-contract-balance))
   (stx-get-balance (as-contract tx-sender))
-)
 
-(define-read-only (get-job-counter)
+(define-read-only (get-job-counter))
   (var-get job-counter)
-)
 
-(define-read-only (get-dispute-counter)
+(define-read-only (get-dispute-counter))
   (var-get dispute-counter)
-)
+
+(define-read-only (get-rating-counter))
+  (var-get rating-counter)
