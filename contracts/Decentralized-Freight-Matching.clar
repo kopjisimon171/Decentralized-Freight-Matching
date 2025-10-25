@@ -1,4 +1,4 @@
-﻿(define-constant CONTRACT_OWNER tx-sender)
+(define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_NOT_AUTHORIZED (err u100))
 (define-constant ERR_JOB_NOT_FOUND (err u101))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u102))
@@ -13,6 +13,9 @@
 (define-constant ERR_ALREADY_RATED (err u111))
 (define-constant ERR_INVALID_RATING (err u112))
 (define-constant ERR_CANNOT_RATE_SELF (err u113))
+(define-constant ERR_BID_NOT_FOUND (err u114))
+(define-constant ERR_INVALID_BID_AMOUNT (err u115))
+(define-constant ERR_BID_ALREADY_ACCEPTED (err u116))
 
 (define-constant MIN_STAKE u1000000)
 (define-constant PLATFORM_FEE_PERCENT u2)
@@ -22,6 +25,7 @@
 (define-data-var job-counter uint u0)
 (define-data-var dispute-counter uint u0)
 (define-data-var rating-counter uint u0)
+(define-data-var bid-counter uint u0)
 
 (define-map jobs
   uint
@@ -93,6 +97,27 @@
   {
     has-been-rated: bool,
     rating-id: (optional uint)
+  }
+)
+
+(define-map job-bids
+  uint
+  {
+    job-id: uint,
+    driver: principal,
+    bid-amount: uint,
+    proposed-stake: uint,
+    status: (string-ascii 20),
+    created-at: uint,
+    message: (string-ascii 200)
+  }
+)
+
+(define-map job-bid-list
+  uint
+  {
+    bid-ids: (list 50 uint),
+    total-bids: uint
   }
 )
 
@@ -181,6 +206,95 @@
     
     (var-set job-counter job-id)
     (ok job-id)
+  )
+)
+
+(define-public (post-bid 
+  (job-id uint)
+  (bid-amount uint)
+  (proposed-stake uint)
+  (message (string-ascii 200))
+)
+  (let (
+    (job (unwrap! (map-get? jobs job-id) ERR_JOB_NOT_FOUND))
+    (bid-id (+ (var-get bid-counter) u1))
+    (current-bid-list (default-to
+      {bid-ids: (list), total-bids: u0}
+      (map-get? job-bid-list job-id)
+    ))
+    (updated-bid-ids (unwrap! (as-max-len? (append (get bid-ids current-bid-list) bid-id) u50) ERR_INVALID_STATUS))
+  )
+    (asserts! (is-eq (get status job) "posted") ERR_INVALID_STATUS)
+    (asserts! (> bid-amount u0) ERR_INVALID_BID_AMOUNT)
+    (asserts! (>= proposed-stake MIN_STAKE) ERR_INSUFFICIENT_STAKE)
+    
+    (map-set job-bids bid-id
+      {
+        job-id: job-id,
+        driver: tx-sender,
+        bid-amount: bid-amount,
+        proposed-stake: proposed-stake,
+        status: "pending",
+        created-at: stacks-block-height,
+        message: message
+      }
+    )
+    
+    (map-set job-bid-list job-id
+      {
+        bid-ids: updated-bid-ids,
+        total-bids: (+ (get total-bids current-bid-list) u1)
+      }
+    )
+    
+    (var-set bid-counter bid-id)
+    (ok bid-id)
+  )
+)
+
+(define-public (accept-bid (bid-id uint))
+  (let (
+    (bid (unwrap! (map-get? job-bids bid-id) ERR_BID_NOT_FOUND))
+    (job-id (get job-id bid))
+    (job (unwrap! (map-get? jobs job-id) ERR_JOB_NOT_FOUND))
+    (driver (get driver bid))
+    (stake-amount (get proposed-stake bid))
+    (payment-amount (get bid-amount bid))
+    (original-payment (get payment-amount job))
+    (platform-fee (get-platform-fee original-payment))
+    (refund-amount (if (> original-payment payment-amount)
+                     (- original-payment payment-amount)
+                     u0))
+  )
+    (asserts! (is-eq tx-sender (get shipper job)) ERR_NOT_SHIPPER)
+    (asserts! (is-eq (get status job) "posted") ERR_INVALID_STATUS)
+    (asserts! (is-eq (get status bid) "pending") ERR_BID_ALREADY_ACCEPTED)
+    (asserts! (>= (stx-get-balance driver) stake-amount) ERR_INSUFFICIENT_STAKE)
+    
+    (try! (stx-transfer? stake-amount driver (as-contract tx-sender)))
+    
+    (if (> refund-amount u0)
+      (try! (as-contract (stx-transfer? refund-amount tx-sender (get shipper job))))
+      true
+    )
+    
+    (map-set jobs job-id (merge job {
+      driver: (some driver),
+      payment-amount: payment-amount,
+      stake-required: stake-amount,
+      status: "accepted",
+      accepted-at: (some stacks-block-height)
+    }))
+    
+    (map-set job-stakes job-id {
+      driver: driver,
+      stake-amount: stake-amount,
+      staked-at: stacks-block-height
+    })
+    
+    (map-set job-bids bid-id (merge bid {status: "accepted"}))
+    
+    (ok true)
   )
 )
 
@@ -429,14 +543,30 @@
   (map-get? job-ratings job-id)
 )
 
-(define-read-only (get-contract-balance))
+(define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender))
+)
 
-(define-read-only (get-job-counter))
+(define-read-only (get-job-counter)
   (var-get job-counter)
+)
 
-(define-read-only (get-dispute-counter))
+(define-read-only (get-dispute-counter)
   (var-get dispute-counter)
+)
 
-(define-read-only (get-rating-counter))
+(define-read-only (get-rating-counter)
   (var-get rating-counter)
+)
+
+(define-read-only (get-bid (bid-id uint))
+  (map-get? job-bids bid-id)
+)
+
+(define-read-only (get-job-bids (job-id uint))
+  (map-get? job-bid-list job-id)
+)
+
+(define-read-only (get-bid-counter)
+  (var-get bid-counter)
+)
