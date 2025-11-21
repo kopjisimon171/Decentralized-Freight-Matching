@@ -3,10 +3,14 @@ name = 'Decentralized-Freight-Matching'
 description = ''
 authors = []
 telemetry = true
-cache_dir = '.\.cache'
+cache_dir = '.\\.cache'
 requirements = []
 [contracts.Decentralized-Freight-Matching]
 path = 'contracts/Decentralized-Freight-Matching.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.shipment-escrow]
+path = 'contracts/shipment-escrow.clar'
 clarity_version = 3
 epoch = 3.1
 [repl.analysis]
